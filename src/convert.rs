@@ -189,9 +189,9 @@ impl<'a> TryFrom<Order<'a>> for (String, bool) {
 
     fn try_from(o: Order<'a>) -> Result<Self, Self::Error> {
         let (name, is_asc) = if let OrderByKind::Expressions(order_by_list) = &o.0.kind {
-            let order_by = order_by_list.first().unwrap();
+            let order_by = order_by_list.first().ok_or_else(|| anyhow!("Unsupported order by kind"))?;
             let name = match &order_by.expr {
-                SqlExpr::Identifier(id) => id.to_string(),
+                SqlExpr::Identifier(id) => &id.value,
                 expr => {
                     return Err(anyhow!(
                         "We only support identifier for order by, got {}",
@@ -199,14 +199,8 @@ impl<'a> TryFrom<Order<'a>> for (String, bool) {
                     ))
                 }
             };
-            let is_asc = match &order_by.options {
-                OrderByOptions {
-                    asc: Some(asc),
-                    ..
-                } => *asc,
-                _ => true,
-            };
-            (name, is_asc)
+            let is_asc = order_by.options.asc.unwrap_or(false);
+            (name.to_string(), is_asc)
         } else {
             ("".to_string(), false)
         };
