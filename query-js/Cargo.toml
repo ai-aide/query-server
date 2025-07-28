@@ -1,0 +1,16 @@
+[package]
+name = "query-js"
+version = "0.1.0"
+edition = "2024"
+description = "query-js"
+license = "MIT"
+exclude = ["index.node"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+query-rs = { path = "../query-rs" }
+tokio = { version = "1", features = ["full"] }
+neon = "1.1.1"

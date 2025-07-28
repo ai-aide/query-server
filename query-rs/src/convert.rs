@@ -1,8 +1,12 @@
 use anyhow::{Result, anyhow};
 use polars::prelude::*;
 // use polars
-use sqlparser::ast::{BinaryOperator as SqlBinaryOperator, Expr as SqlExpr, LimitClause, ObjectNamePart, Offset as SqlOffset, OrderBy, OrderByKind, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value as SqlValue, ValueWithSpan, OrderByOptions};
 use polars_plan::plans::{DynLiteralValue, LiteralValue};
+use sqlparser::ast::{
+    BinaryOperator as SqlBinaryOperator, Expr as SqlExpr, LimitClause, ObjectNamePart,
+    Offset as SqlOffset, OrderBy, OrderByKind, OrderByOptions, Select, SelectItem, SetExpr,
+    Statement, TableFactor, TableWithJoins, Value as SqlValue, ValueWithSpan,
+};
 
 /// 解析出来的 Sql
 pub struct Sql<'a> {
@@ -15,6 +19,7 @@ pub struct Sql<'a> {
 }
 
 // 因为 Rust trait 的孤儿原则，对已有的类型实现已有的 trait
+// 所以这里不能直接用
 pub struct Expression(pub(crate) Box<SqlExpr>);
 pub struct Operation(pub(crate) SqlBinaryOperator);
 pub struct Projection<'a>(pub(crate) &'a SelectItem);
@@ -32,15 +37,11 @@ impl<'a> TryFrom<&'a Statement> for Sql<'a> {
         match sql {
             // 目前只关心 query (select ... from ... where ...)
             Statement::Query(q) => {
-                let (limit, offset) = if let Some(limit_clause )=  &q.limit_clause {
-                    match limit_clause {
-                        LimitClause::LimitOffset { limit, offset, .. } => {
-                            (limit, offset)
-                        }
-                        _ => (&None, &None)
+                let (limit, offset) = match &q.limit_clause {
+                    Some(LimitClause::LimitOffset { limit, offset, .. }) => {
+                        (limit.as_ref(), offset.as_ref())
                     }
-                } else {
-                    (&None, &None)
+                    _ => (None, None),
                 };
                 let orders = q.order_by.as_ref();
                 let Select {
@@ -57,6 +58,7 @@ impl<'a> TryFrom<&'a Statement> for Sql<'a> {
 
                 let source = Source(table_with_joins).try_into()?;
 
+                println!("---- where expression: {:#?}\n\n", where_clause);
                 let condition = match where_clause {
                     Some(expr) => Some(Expression(Box::new(expr.to_owned())).try_into()?),
                     None => None,
@@ -74,8 +76,8 @@ impl<'a> TryFrom<&'a Statement> for Sql<'a> {
                     order_by.push(order);
                 }
 
-                let limit = limit.as_ref().map(|v| Limit(v).into());
-                let offset = offset.as_ref().map(|v| Offset(v).into());
+                let limit = limit.map(|v| Limit(v).into());
+                let offset = offset.map(|v| Offset(v).into());
 
                 Ok(Sql {
                     selection,
@@ -98,17 +100,20 @@ impl TryFrom<Expression> for Expr {
 
     fn try_from(expr: Expression) -> std::result::Result<Self, Self::Error> {
         match *expr.0 {
-            SqlExpr::BinaryOp {
-                left, op, right
-            } => Ok(Expr::BinaryExpr {
+            SqlExpr::BinaryOp { left, op, right } => Ok(Expr::BinaryExpr {
                 left: Arc::new(Expression(left).try_into()?),
                 op: Operation(op).try_into()?,
                 right: Arc::new(Expression(right).try_into()?),
             }),
             SqlExpr::Wildcard(_num) => Ok(Self::Wildcard),
             SqlExpr::Identifier(ident) => Ok(Self::Column(ident.value.into())),
+            SqlExpr::Value(v) => {
+                // Err(anyhow!("expr value {} is not supported", value))
+                // Self::var(self, ddof)
+                Ok(Self::Literal(Value(v.value).try_into()?))
+            }
             v => Err(anyhow!("expr {:#?} is not supported", v)),
-        }   
+        }
     }
 }
 
@@ -131,7 +136,7 @@ impl TryFrom<Operation> for Operator {
             SqlBinaryOperator::NotEq => Ok(Self::NotEq),
             SqlBinaryOperator::And => Ok(Self::And),
             SqlBinaryOperator::Or => Ok(Self::Or),
-            v=> Err(anyhow!("Operator {} is not supported", v)),
+            v => Err(anyhow!("Operator {} is not supported", v)),
         }
     }
 }
@@ -150,7 +155,7 @@ impl<'a> TryFrom<Projection<'a>> for Expr {
                 Arc::new(Expr::Column((&id.value).into())),
                 (&alias.value).to_owned().into(),
             )),
-            item=> Err(anyhow!("projection {} not supported", item)),
+            item => Err(anyhow!("projection {} not supported", item)),
         }
     }
 }
@@ -170,14 +175,11 @@ impl<'a> TryFrom<Source<'a>> for &'a str {
 
         match &table.relation {
             TableFactor::Table { name, .. } => {
-                if let ObjectNamePart::Identifier(
-                    ident
-                ) = &name.0.first().unwrap() {
-                    Ok(&ident.value)
-                } else {
-                    Err(anyhow!("We only support table"))
-                }
-            },
+                let Some(ObjectNamePart::Identifier(ident)) = &name.0.first() else {
+                    return Err(anyhow!("We only support table"));
+                };
+                Ok(&ident.value)
+            }
             _ => Err(anyhow!("We only support table")),
         }
     }
@@ -188,21 +190,25 @@ impl<'a> TryFrom<Order<'a>> for (String, bool) {
     type Error = anyhow::Error;
 
     fn try_from(o: Order<'a>) -> Result<Self, Self::Error> {
-        let (name, is_asc) = if let OrderByKind::Expressions(order_by_list) = &o.0.kind {
-            let order_by = order_by_list.first().ok_or_else(|| anyhow!("Unsupported order by kind"))?;
-            let name = match &order_by.expr {
-                SqlExpr::Identifier(id) => &id.value,
-                expr => {
-                    return Err(anyhow!(
-                        "We only support identifier for order by, got {}",
-                        expr
-                    ))
-                }
-            };
-            let is_asc = order_by.options.asc.unwrap_or(false);
-            (name.to_string(), is_asc)
-        } else {
-            ("".to_string(), false)
+        let (name, is_asc) = match &o.0.kind {
+            OrderByKind::Expressions(order_by_list) => {
+                let order_by = order_by_list
+                    .first()
+                    .ok_or_else(|| anyhow!("Unsupported order by kind"))?;
+
+                let name = match &order_by.expr {
+                    SqlExpr::Identifier(id) => &id.value,
+                    expr => {
+                        return Err(anyhow!(
+                            "We only support identifier for order by, got {}",
+                            expr
+                        ));
+                    }
+                };
+                let is_asc = order_by.options.asc.unwrap_or(false);
+                (name.to_string(), is_asc)
+            }
+            _ => (String::new(), false),
         };
 
         Ok((name, is_asc))
@@ -214,11 +220,13 @@ impl<'a> From<Offset<'a>> for i64 {
     fn from(offset: Offset<'a>) -> Self {
         match offset.0 {
             SqlOffset {
-                value: SqlExpr::Value(ValueWithSpan{ value: SqlValue::Number(v, _b), ..  }),
+                value:
+                    SqlExpr::Value(ValueWithSpan {
+                        value: SqlValue::Number(v, _b),
+                        ..
+                    }),
                 ..
-            } => {
-                v.parse().unwrap_or(0)
-            },
+            } => v.parse().unwrap_or(0),
             _ => 0,
         }
     }
@@ -228,13 +236,13 @@ impl<'a> From<Offset<'a>> for i64 {
 impl<'a> From<Limit<'a>> for usize {
     fn from(l: Limit<'a>) -> Self {
         match l.0 {
-            SqlExpr::Value(ValueWithSpan{value, ..}) => {
+            SqlExpr::Value(ValueWithSpan { value, .. }) => {
                 if let SqlValue::Number(v, _b) = value {
                     v.parse().unwrap_or(usize::MAX)
                 } else {
                     usize::MAX
                 }
-            },
+            }
             _ => usize::MAX,
         }
     }
@@ -246,10 +254,10 @@ impl TryFrom<Value> for LiteralValue {
 
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value.0 {
-            SqlValue::Number(v, _a) => {
-                Ok(LiteralValue::Dyn(DynLiteralValue::Float(v.parse().unwrap())))
-            },
-            v => Err(anyhow!("Value {} is not supported", v))
+            SqlValue::Number(v, _a) => Ok(LiteralValue::Dyn(DynLiteralValue::Float(
+                v.parse().unwrap_or_default(),
+            ))),
+            v => Err(anyhow!("Value {} is not supported", v)),
         }
     }
 }
@@ -259,7 +267,7 @@ mod tests {
     use super::*;
     use crate::TyrDialect;
     use sqlparser::parser::Parser;
-    
+
     #[test]
     fn parse_sql_works() {
         let url = "http://abc.xyz/abc?a=1&b=2";
@@ -268,7 +276,6 @@ mod tests {
             url
         );
         let statement = &Parser::parse_sql(&TyrDialect::default(), sql.as_ref()).unwrap()[0];
-        println!("-----++++++++++ {:?}", statement);
         let sql: Sql = statement.try_into().unwrap();
         assert_eq!(sql.source, url);
         assert_eq!(sql.limit, Some(5));
@@ -277,7 +284,3 @@ mod tests {
         assert_eq!(sql.selection, vec![col("a"), col("b"), col("c")]);
     }
 }
-
-
-
-
