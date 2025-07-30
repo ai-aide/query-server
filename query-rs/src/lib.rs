@@ -4,14 +4,13 @@ use sqlparser::parser::Parser;
 use std::convert::TryInto;
 use std::ops::{Deref, DerefMut};
 use std::usize;
-use tracing::info;
 
 pub mod convert;
 pub mod dialect;
 pub mod fetcher;
 pub mod loader;
 
-use convert::Sql;
+use convert::{OrderType, Sql};
 pub use dialect::TyrDialect;
 pub use dialect::example_sql;
 use fetcher::retrieve_data;
@@ -73,9 +72,16 @@ pub async fn query<T: AsRef<str>>(sql: T) -> Result<DataSet> {
         None => ds.0.lazy(),
     };
 
-    // filtered = order_by.into_iter().fold(filtered, |acc, (col, desc)| {
-    //     acc.sort(&col, desc)
-    // });
+    let order_list = order_by
+        .into_iter()
+        .map(|(col, order_type)| (col, order_type == OrderType::Desc))
+        .collect::<Vec<(String, bool)>>();
+    let (cols, orders): (Vec<String>, Vec<bool>) = order_list.into_iter().unzip();
+
+    filtered = filtered.sort(
+        cols,
+        SortMultipleOptions::default().with_order_descending_multi(orders),
+    );
 
     if offset.is_some() || limit.is_some() {
         filtered = filtered.slice(offset.unwrap_or(0), limit.unwrap_or(usize::MAX) as IdxSize);

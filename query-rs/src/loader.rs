@@ -25,7 +25,7 @@ impl Loader {
 }
 
 pub fn detect_content(data: String) -> Loader {
-    // ToDo 内容检测
+    // ToDo Content Detection
     Loader::Csv(CsvLoader(data))
 }
 

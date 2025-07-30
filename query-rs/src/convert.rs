@@ -3,47 +3,65 @@ use polars::prelude::*;
 // use polars
 use polars_plan::plans::{DynLiteralValue, LiteralValue};
 use sqlparser::ast::{
-    BinaryOperator as SqlBinaryOperator, Expr as SqlExpr, LimitClause, ObjectNamePart,
-    Offset as SqlOffset, OrderBy, OrderByKind, OrderByOptions, Select, SelectItem, SetExpr,
-    Statement, TableFactor, TableWithJoins, Value as SqlValue, ValueWithSpan,
+    BinaryOperator as SqlBinaryOperator, Expr as SqlExpr, Ident, LimitClause, ObjectNamePart,
+    Offset as SqlOffset, OrderBy, OrderByKind, Select, SelectItem, SetExpr, Statement, TableFactor,
+    TableWithJoins, Value as SqlValue, ValueWithSpan,
 };
 
-/// 解析出来的 Sql
+/// Custom Sql struct
 pub struct Sql<'a> {
     pub(crate) selection: Vec<Expr>,
     pub(crate) condition: Option<Expr>,
     pub(crate) source: &'a str,
-    pub(crate) order_by: Vec<(String, bool)>,
+    pub(crate) order_by: Vec<(String, OrderType)>,
     pub(crate) offset: Option<i64>,
     pub(crate) limit: Option<usize>,
 }
 
-// 因为 Rust trait 的孤儿原则，对已有的类型实现已有的 trait
-// 所以这里不能直接用
-pub struct Expression(pub(crate) Box<SqlExpr>);
-pub struct Operation(pub(crate) SqlBinaryOperator);
-pub struct Projection<'a>(pub(crate) &'a SelectItem);
-pub struct Source<'a>(pub(crate) &'a [TableWithJoins]);
-pub struct Order<'a>(pub(crate) &'a OrderBy);
-pub struct Offset<'a>(pub(crate) &'a SqlOffset);
-pub struct Limit<'a>(pub(crate) &'a SqlExpr);
-pub struct Value(pub(crate) SqlValue);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OrderType {
+    Asc,
+    Desc,
+}
 
-/// 把 SqlParser 解析出来的 Statement 转换成我们需要的结构
+pub struct InterimExpr(pub(crate) Box<SqlExpr>);
+pub struct InterimOperator(pub(crate) SqlBinaryOperator);
+// Selection item, example: age > 10
+pub struct InterimSelectItem<'a>(pub(crate) &'a SelectItem);
+// Source table
+pub struct InterimSource<'a>(pub(crate) &'a [TableWithJoins]);
+// Order formula, example: order by member_id
+pub struct InterimOrderBy<'a>(pub(crate) &'a OrderBy);
+
+pub struct InterimOffset<'a>(pub(crate) &'a SqlOffset);
+pub struct InterimLimit<'a>(pub(crate) &'a SqlExpr);
+pub struct InterimValue(pub(crate) SqlValue);
+
+/// Convert sqlparser statement to Custom Sql struct
 impl<'a> TryFrom<&'a Statement> for Sql<'a> {
     type Error = anyhow::Error;
 
     fn try_from(sql: &'a Statement) -> Result<Self, Self::Error> {
         match sql {
-            // 目前只关心 query (select ... from ... where ...)
             Statement::Query(q) => {
+                // limit and offset
                 let (limit, offset) = match &q.limit_clause {
                     Some(LimitClause::LimitOffset { limit, offset, .. }) => {
                         (limit.as_ref(), offset.as_ref())
                     }
                     _ => (None, None),
                 };
+                let limit = limit.map(|v| InterimLimit(v).into());
+                let offset = offset.map(|v| InterimOffset(v).into());
+
+                // order by
+                let mut order_by = Vec::new();
                 let orders = q.order_by.as_ref();
+                if let Some(expr) = orders {
+                    order_by = InterimOrderBy(expr).try_into()?;
+                }
+
+                // Select, including table, selection, projection
                 let Select {
                     from: table_with_joins,
                     selection: where_clause,
@@ -55,29 +73,18 @@ impl<'a> TryFrom<&'a Statement> for Sql<'a> {
                     SetExpr::Select(statement) => statement.as_ref(),
                     _ => return Err(anyhow!("We only support Select Query at the moment")),
                 };
+                let source = InterimSource(table_with_joins).try_into()?;
 
-                let source = Source(table_with_joins).try_into()?;
-
-                println!("---- where expression: {:#?}\n\n", where_clause);
                 let condition = match where_clause {
-                    Some(expr) => Some(Expression(Box::new(expr.to_owned())).try_into()?),
+                    Some(expr) => Some(InterimExpr(Box::new(expr.to_owned())).try_into()?),
                     None => None,
                 };
 
                 let mut selection = Vec::with_capacity(8);
                 for p in projection {
-                    let expr = Projection(p).try_into()?;
+                    let expr = InterimSelectItem(p).try_into()?;
                     selection.push(expr);
                 }
-
-                let mut order_by = Vec::new();
-                if let Some(expr) = orders {
-                    let order = Order(expr).try_into()?;
-                    order_by.push(order);
-                }
-
-                let limit = limit.map(|v| Limit(v).into());
-                let offset = offset.map(|v| Offset(v).into());
 
                 Ok(Sql {
                     selection,
@@ -87,41 +94,56 @@ impl<'a> TryFrom<&'a Statement> for Sql<'a> {
                     condition,
                     order_by,
                 })
-                // Err(anyhow!("We only support Select Query at the moment"))
             }
             _ => Err(anyhow!("We only support Query at the moment")),
         }
     }
 }
 
-/// 把 SqlParser 的 Expr 转换成 DataFrame 的 Expr
-impl TryFrom<Expression> for Expr {
+/// Convert SqlParser Expr To DataFrame Expr
+impl TryFrom<InterimExpr> for Expr {
     type Error = anyhow::Error;
 
-    fn try_from(expr: Expression) -> std::result::Result<Self, Self::Error> {
+    fn try_from(expr: InterimExpr) -> std::result::Result<Self, Self::Error> {
         match *expr.0 {
             SqlExpr::BinaryOp { left, op, right } => Ok(Expr::BinaryExpr {
-                left: Arc::new(Expression(left).try_into()?),
-                op: Operation(op).try_into()?,
-                right: Arc::new(Expression(right).try_into()?),
+                left: Arc::new(InterimExpr(left).try_into()?),
+                op: InterimOperator(op).try_into()?,
+                right: Arc::new(InterimExpr(right).try_into()?),
             }),
             SqlExpr::Wildcard(_num) => Ok(Self::Wildcard),
-            SqlExpr::Identifier(ident) => Ok(Self::Column(ident.value.into())),
-            SqlExpr::Value(v) => {
-                // Err(anyhow!("expr value {} is not supported", value))
-                // Self::var(self, ddof)
-                Ok(Self::Literal(Value(v.value).try_into()?))
+            SqlExpr::Identifier(ident) => {
+                for op in ["=", ">", ">=", "<", "<="].into_iter() {
+                    if let Some((left, right)) = ident.value.split_once(op) {
+                        let temp_op: InterimOperator = op.try_into()?;
+                        return Ok(Expr::BinaryExpr {
+                            left: Arc::new(
+                                InterimExpr(Box::new(SqlExpr::Identifier(Ident::new(left))))
+                                    .try_into()?,
+                            ),
+                            op: temp_op.try_into()?,
+                            right: Arc::new(
+                                InterimExpr(Box::new(SqlExpr::Value(
+                                    SqlValue::Number(right.to_owned(), true).into(),
+                                )))
+                                .try_into()?,
+                            ),
+                        });
+                    }
+                }
+                Ok(Self::Column(ident.value.into()))
             }
+            SqlExpr::Value(v) => Ok(Self::Literal(InterimValue(v.value).try_into()?)),
             v => Err(anyhow!("expr {:#?} is not supported", v)),
         }
     }
 }
 
-/// 把 SqlParser 的 BinaryOperator 转换成 DataFrame 的 Operator
-impl TryFrom<Operation> for Operator {
+/// Convert SqlParser BinaryOperator To DataFrame Operator
+impl TryFrom<InterimOperator> for Operator {
     type Error = anyhow::Error;
 
-    fn try_from(op: Operation) -> std::result::Result<Self, Self::Error> {
+    fn try_from(op: InterimOperator) -> std::result::Result<Self, Self::Error> {
         match op.0 {
             SqlBinaryOperator::Plus => Ok(Self::Plus),
             SqlBinaryOperator::Minus => Ok(Self::Minus),
@@ -141,11 +163,27 @@ impl TryFrom<Operation> for Operator {
     }
 }
 
-/// 把 SqlParser 的 SelectItem 转换成 DataFrame 的 Expr
-impl<'a> TryFrom<Projection<'a>> for Expr {
+/// Convert &str(>,>=,<,<=,=) to Interim Operation
+impl TryFrom<&str> for InterimOperator {
     type Error = anyhow::Error;
 
-    fn try_from(p: Projection<'a>) -> std::result::Result<Self, Self::Error> {
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        match value {
+            ">" => Ok(InterimOperator(SqlBinaryOperator::Gt)),
+            ">=" => Ok(InterimOperator(SqlBinaryOperator::GtEq)),
+            "=" => Ok(InterimOperator(SqlBinaryOperator::Eq)),
+            "<" => Ok(InterimOperator(SqlBinaryOperator::Lt)),
+            "<=" => Ok(InterimOperator(SqlBinaryOperator::LtEq)),
+            _ => Err(anyhow!("Operator {} is not supported", value)),
+        }
+    }
+}
+
+/// Convert SqlParser SelectItem to Expr of polars
+impl<'a> TryFrom<InterimSelectItem<'a>> for Expr {
+    type Error = anyhow::Error;
+
+    fn try_from(p: InterimSelectItem<'a>) -> std::result::Result<Self, Self::Error> {
         match p.0 {
             SelectItem::UnnamedExpr(SqlExpr::Identifier(id)) => Ok(col(&id.to_string())),
             SelectItem::ExprWithAlias {
@@ -160,10 +198,11 @@ impl<'a> TryFrom<Projection<'a>> for Expr {
     }
 }
 
-impl<'a> TryFrom<Source<'a>> for &'a str {
+impl<'a> TryFrom<InterimSource<'a>> for &'a str {
     type Error = anyhow::Error;
 
-    fn try_from(source: Source<'a>) -> Result<Self, Self::Error> {
+    fn try_from(source: InterimSource<'a>) -> Result<Self, Self::Error> {
+        // ToDo
         if source.0.len() != 1 {
             return Err(anyhow!("We only support single data source at the moment"));
         }
@@ -185,39 +224,51 @@ impl<'a> TryFrom<Source<'a>> for &'a str {
     }
 }
 
-/// 把 SqlParser 的 order by expr 转换成（列名，排序方法）
-impl<'a> TryFrom<Order<'a>> for (String, bool) {
+/// Convert SqlParser order by expr to Vec<(String, OrderType)>
+impl<'a> TryFrom<InterimOrderBy<'a>> for Vec<(String, OrderType)> {
     type Error = anyhow::Error;
 
-    fn try_from(o: Order<'a>) -> Result<Self, Self::Error> {
-        let (name, is_asc) = match &o.0.kind {
+    fn try_from(o: InterimOrderBy<'a>) -> Result<Self, Self::Error> {
+        let order_list = match &o.0.kind {
             OrderByKind::Expressions(order_by_list) => {
-                let order_by = order_by_list
-                    .first()
-                    .ok_or_else(|| anyhow!("Unsupported order by kind"))?;
+                let order_list = order_by_list.iter().rfold(
+                    Vec::new(),
+                    |mut acc: Vec<(String, OrderType)>, order_by| {
+                        if let SqlExpr::Identifier(id) = &order_by.expr {
+                            let order_type = if let Some(is_asc) = order_by.options.asc {
+                                if is_asc == true {
+                                    OrderType::Asc
+                                } else {
+                                    OrderType::Desc
+                                }
+                            } else if let Some((_, order_type)) = acc.last() {
+                                order_type.to_owned()
+                            } else {
+                                OrderType::Desc
+                            };
+                            acc.push((id.value.to_string(), order_type));
+                        } else {
+                            println!(
+                                "We only support identifier for order by, get {}",
+                                &order_by.expr
+                            );
+                        }
+                        acc
+                    },
+                );
 
-                let name = match &order_by.expr {
-                    SqlExpr::Identifier(id) => &id.value,
-                    expr => {
-                        return Err(anyhow!(
-                            "We only support identifier for order by, got {}",
-                            expr
-                        ));
-                    }
-                };
-                let is_asc = order_by.options.asc.unwrap_or(false);
-                (name.to_string(), is_asc)
+                order_list.iter().rev().cloned().collect()
             }
-            _ => (String::new(), false),
+            _ => vec![],
         };
 
-        Ok((name, is_asc))
+        Ok(order_list)
     }
 }
 
-/// 把 SqlParser 的 offset expr 转换成 i64
-impl<'a> From<Offset<'a>> for i64 {
-    fn from(offset: Offset<'a>) -> Self {
+/// Convert SqlParser offset expr to i64
+impl<'a> From<InterimOffset<'a>> for i64 {
+    fn from(offset: InterimOffset<'a>) -> Self {
         match offset.0 {
             SqlOffset {
                 value:
@@ -232,9 +283,9 @@ impl<'a> From<Offset<'a>> for i64 {
     }
 }
 
-/// 把 SqlParser 的 Limit expr 转换成 usize
-impl<'a> From<Limit<'a>> for usize {
-    fn from(l: Limit<'a>) -> Self {
+/// Convert SqlParser limit expr to usize
+impl<'a> From<InterimLimit<'a>> for usize {
+    fn from(l: InterimLimit<'a>) -> Self {
         match l.0 {
             SqlExpr::Value(ValueWithSpan { value, .. }) => {
                 if let SqlValue::Number(v, _b) = value {
@@ -248,13 +299,13 @@ impl<'a> From<Limit<'a>> for usize {
     }
 }
 
-/// 把 SqlParser 的 Value 转换成 DataFrame 支持的 LiteralValue
-impl TryFrom<Value> for LiteralValue {
+/// Convert SqlParser Value to LiteralValue of polars
+impl TryFrom<InterimValue> for LiteralValue {
     type Error = anyhow::Error;
 
-    fn try_from(value: Value) -> Result<Self, Self::Error> {
+    fn try_from(value: InterimValue) -> Result<Self, Self::Error> {
         match value.0 {
-            SqlValue::Number(v, _a) => Ok(LiteralValue::Dyn(DynLiteralValue::Float(
+            SqlValue::Number(v, _) => Ok(LiteralValue::Dyn(DynLiteralValue::Float(
                 v.parse().unwrap_or_default(),
             ))),
             v => Err(anyhow!("Value {} is not supported", v)),
@@ -272,15 +323,65 @@ mod tests {
     fn parse_sql_works() {
         let url = "http://abc.xyz/abc?a=1&b=2";
         let sql = format!(
-            "select a, b, c from {} where a=100 order by c asc limit 5 offset 10",
+            "SELECT
+                a, 
+                b, 
+                c 
+            FROM {} 
+            WHERE a = 100 and b = 200 and c=300 
+            ORDER BY c, e DESC, b ASC 
+            LIMIT 5 OFFSET 10",
             url
         );
         let statement = &Parser::parse_sql(&TyrDialect::default(), sql.as_ref()).unwrap()[0];
         let sql: Sql = statement.try_into().unwrap();
+        // verify data source
         assert_eq!(sql.source, url);
+        let fisrt_condition = Expr::BinaryExpr {
+            left: Arc::new(Expr::Column("a".into())),
+            op: Operator::Eq,
+            right: Arc::new(Expr::Literal(LiteralValue::Dyn(DynLiteralValue::Float(
+                100 as f64,
+            )))),
+        };
+        let second_condition = Expr::BinaryExpr {
+            left: Arc::new(Expr::Column("b".into())),
+            op: Operator::Eq,
+            right: Arc::new(Expr::Literal(LiteralValue::Dyn(DynLiteralValue::Float(
+                200 as f64,
+            )))),
+        };
+        let third_condition = Expr::BinaryExpr {
+            left: Arc::new(Expr::Column("c".into())),
+            op: Operator::Eq,
+            right: Arc::new(Expr::Literal(LiteralValue::Dyn(DynLiteralValue::Float(
+                300 as f64,
+            )))),
+        };
+        let inner_conditon = Expr::BinaryExpr {
+            left: Arc::new(fisrt_condition),
+            op: Operator::And,
+            right: Arc::new(second_condition),
+        };
+        let condition = Expr::BinaryExpr {
+            left: Arc::new(inner_conditon),
+            op: Operator::And,
+            right: Arc::new(third_condition),
+        };
+        // verify select condition
+        assert_eq!(sql.condition, Some(condition));
         assert_eq!(sql.limit, Some(5));
         assert_eq!(sql.offset, Some(10));
-        assert_eq!(sql.order_by, vec![("c".into(), true)]);
+        // verify order by
+        assert_eq!(
+            sql.order_by,
+            vec![
+                ("c".into(), OrderType::Desc),
+                ("e".into(), OrderType::Desc),
+                ("b".into(), OrderType::Asc)
+            ]
+        );
+        // verify select item
         assert_eq!(sql.selection, vec![col("a"), col("b"), col("c")]);
     }
 }

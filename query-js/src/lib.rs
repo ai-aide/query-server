@@ -6,15 +6,15 @@ pub fn example_sql(mut cx: FunctionContext) -> JsResult<JsString> {
 
 fn query(mut cx: FunctionContext) -> JsResult<JsString> {
     let sql = cx.argument::<JsString>(0)?.value(&mut cx);
-    let output = match cx.argument::<JsString>(1) {
-        Ok(v) => v.value(&mut cx),
-        Err(_) => "csv".to_string(),
+    let output = match cx.argument_opt(1) {
+        Some(v) => v.to_string(&mut cx)?.value(&mut cx),
+        None => "csv".to_string(),
     };
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut data = rt.block_on(async { query_rs::query(sql).await.unwrap() });
 
     match output.as_str() {
-        "csv" => Ok(cx.string(data.to_csv().unwrap())),
+        "csv" => Ok(cx.string(data.to_csv().unwrap_or("csv type error".to_owned()))),
         v => cx.throw_type_error(format!("Output type {} not supported", v)),
     }
 }

@@ -7,18 +7,12 @@ async fn main() -> Result<()> {
 
     let url = "https://raw.githubusercontent.com/owid/covid-19-data/master/public/data/latest/owid-covid-latest.csv";
     let sql = format!(
-        "SELECT location name, total_cases, new_cases, total_deaths, new_deaths  FROM {} where new_deaths >= 500 ORDER BY new_cases DESC LIMIT 6 OFFSET 5",
+        "SELECT location, total_cases, new_cases, total_deaths, new_deaths  FROM {} where new_deaths >= 5 ORDER BY new_cases DESC LIMIT 6 OFFSET 5",
         url
     );
 
-    // 使用 sql 从 URL 里获取数据
-    // let sql = format!(
-    //     "SELECT location name, total_cases, new_cases, total_deaths, new_deaths
-    //     FROM {} where new_deaths >= 500 ORDER BY new_cases DESC",
-    //     url
-    // );
-    let df1 = query(sql).await?;
-    println!("{:?}", df1);
+    let df = query(sql).await?;
+    println!("{:?}", df);
 
     Ok(())
 }

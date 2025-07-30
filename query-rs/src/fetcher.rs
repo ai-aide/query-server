@@ -8,7 +8,6 @@ pub trait Fetch {
     async fn fetch(&self) -> Result<String, Self::Error>;
 }
 
-/// 从文件源或 http 源中获取数据，组成 dataframe
 pub async fn retrieve_data(source: impl AsRef<str>) -> Result<String> {
     let name = source.as_ref();
     match &name[..4] {
