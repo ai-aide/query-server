@@ -1,6 +1,6 @@
+use crate::CustomError;
 use anyhow::{Result, anyhow};
 use polars::prelude::*;
-// use polars
 use polars_plan::plans::{DynLiteralValue, LiteralValue};
 use sqlparser::ast::{
     BinaryOperator as SqlBinaryOperator, Expr as SqlExpr, Ident, LimitClause, ObjectNamePart,
@@ -39,7 +39,7 @@ pub struct InterimValue(pub(crate) SqlValue);
 
 /// Convert sqlparser statement to Custom Sql struct
 impl<'a> TryFrom<&'a Statement> for Sql<'a> {
-    type Error = anyhow::Error;
+    type Error = CustomError;
 
     fn try_from(sql: &'a Statement) -> Result<Self, Self::Error> {
         match sql {
@@ -71,7 +71,7 @@ impl<'a> TryFrom<&'a Statement> for Sql<'a> {
                     ..
                 } = match q.body.as_ref() {
                     SetExpr::Select(statement) => statement.as_ref(),
-                    _ => return Err(anyhow!("We only support Select Query at the moment")),
+                    v => return Err(CustomError::SqlExpressionError(v.to_string())),
                 };
                 let source = InterimSource(table_with_joins).try_into()?;
 
@@ -95,14 +95,14 @@ impl<'a> TryFrom<&'a Statement> for Sql<'a> {
                     order_by,
                 })
             }
-            _ => Err(anyhow!("We only support Query at the moment")),
+            v => Err(CustomError::SqlStatementError(format!("{:?}", v))),
         }
     }
 }
 
 /// Convert SqlParser Expr To DataFrame Expr
 impl TryFrom<InterimExpr> for Expr {
-    type Error = anyhow::Error;
+    type Error = CustomError;
 
     fn try_from(expr: InterimExpr) -> std::result::Result<Self, Self::Error> {
         match *expr.0 {
@@ -134,14 +134,14 @@ impl TryFrom<InterimExpr> for Expr {
                 Ok(Self::Column(ident.value.into()))
             }
             SqlExpr::Value(v) => Ok(Self::Literal(InterimValue(v.value).try_into()?)),
-            v => Err(anyhow!("expr {:#?} is not supported", v)),
+            v => Err(CustomError::SqlExpressionError(format!("{}", v))),
         }
     }
 }
 
 /// Convert SqlParser BinaryOperator To DataFrame Operator
 impl TryFrom<InterimOperator> for Operator {
-    type Error = anyhow::Error;
+    type Error = CustomError;
 
     fn try_from(op: InterimOperator) -> std::result::Result<Self, Self::Error> {
         match op.0 {
@@ -158,14 +158,14 @@ impl TryFrom<InterimOperator> for Operator {
             SqlBinaryOperator::NotEq => Ok(Self::NotEq),
             SqlBinaryOperator::And => Ok(Self::And),
             SqlBinaryOperator::Or => Ok(Self::Or),
-            v => Err(anyhow!("Operator {} is not supported", v)),
+            v => Err(CustomError::SqlOperatorError(v.to_string())),
         }
     }
 }
 
 /// Convert &str(>,>=,<,<=,=) to Interim Operation
 impl TryFrom<&str> for InterimOperator {
-    type Error = anyhow::Error;
+    type Error = CustomError;
 
     fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
         match value {
@@ -174,14 +174,14 @@ impl TryFrom<&str> for InterimOperator {
             "=" => Ok(InterimOperator(SqlBinaryOperator::Eq)),
             "<" => Ok(InterimOperator(SqlBinaryOperator::Lt)),
             "<=" => Ok(InterimOperator(SqlBinaryOperator::LtEq)),
-            _ => Err(anyhow!("Operator {} is not supported", value)),
+            _ => Err(CustomError::SqlOperatorError(value.to_owned())),
         }
     }
 }
 
 /// Convert SqlParser SelectItem to Expr of polars
 impl<'a> TryFrom<InterimSelectItem<'a>> for Expr {
-    type Error = anyhow::Error;
+    type Error = CustomError;
 
     fn try_from(p: InterimSelectItem<'a>) -> std::result::Result<Self, Self::Error> {
         match p.0 {
@@ -193,40 +193,43 @@ impl<'a> TryFrom<InterimSelectItem<'a>> for Expr {
                 Arc::new(Expr::Column((&id.value).into())),
                 (&alias.value).to_owned().into(),
             )),
-            item => Err(anyhow!("projection {} not supported", item)),
+            item => Err(CustomError::SqlSelectItemError(item.to_string())),
         }
     }
 }
 
 impl<'a> TryFrom<InterimSource<'a>> for &'a str {
-    type Error = anyhow::Error;
+    type Error = CustomError;
 
     fn try_from(source: InterimSource<'a>) -> Result<Self, Self::Error> {
         // ToDo
         if source.0.len() != 1 {
-            return Err(anyhow!("We only support single data source at the moment"));
+            return Err(CustomError::SqlTableError("empty".to_string()));
         }
 
         let table = &source.0[0];
         if !table.joins.is_empty() {
-            return Err(anyhow!("We do not support joint data source at the moment"));
+            return Err(CustomError::SqlTableError(format!(
+                "joint table {:?}",
+                table.joins
+            )));
         }
 
         match &table.relation {
             TableFactor::Table { name, .. } => {
                 let Some(ObjectNamePart::Identifier(ident)) = &name.0.first() else {
-                    return Err(anyhow!("We only support table"));
+                    return Err(CustomError::SqlTableError(format!("{:?}", &name.0)));
                 };
                 Ok(&ident.value)
             }
-            _ => Err(anyhow!("We only support table")),
+            v => Err(CustomError::SqlTableError(format!("{:?}", v))),
         }
     }
 }
 
 /// Convert SqlParser order by expr to Vec<(String, OrderType)>
 impl<'a> TryFrom<InterimOrderBy<'a>> for Vec<(String, OrderType)> {
-    type Error = anyhow::Error;
+    type Error = CustomError;
 
     fn try_from(o: InterimOrderBy<'a>) -> Result<Self, Self::Error> {
         let order_list = match &o.0.kind {
@@ -248,6 +251,7 @@ impl<'a> TryFrom<InterimOrderBy<'a>> for Vec<(String, OrderType)> {
                             };
                             acc.push((id.value.to_string(), order_type));
                         } else {
+                            // return Err(CustomError::SqlOrderError(order_by.expr);
                             println!(
                                 "We only support identifier for order by, get {}",
                                 &order_by.expr
@@ -301,14 +305,15 @@ impl<'a> From<InterimLimit<'a>> for usize {
 
 /// Convert SqlParser Value to LiteralValue of polars
 impl TryFrom<InterimValue> for LiteralValue {
-    type Error = anyhow::Error;
+    type Error = CustomError;
 
     fn try_from(value: InterimValue) -> Result<Self, Self::Error> {
         match value.0 {
             SqlValue::Number(v, _) => Ok(LiteralValue::Dyn(DynLiteralValue::Float(
                 v.parse().unwrap_or_default(),
             ))),
-            v => Err(anyhow!("Value {} is not supported", v)),
+            v => Err(CustomError::SqlValueError(format!("{}", v))),
+            // v => Err(anyhow!("Value {} is not supported", v)),
         }
     }
 }

@@ -4,6 +4,7 @@ use sqlparser::parser::Parser;
 use std::convert::TryInto;
 use std::ops::{Deref, DerefMut};
 use std::usize;
+use thiserror::Error;
 
 pub mod convert;
 pub mod dialect;
@@ -14,7 +15,27 @@ use convert::{OrderType, Sql};
 pub use dialect::TyrDialect;
 pub use dialect::example_sql;
 use fetcher::retrieve_data;
-use loader::detect_content;
+use loader::{Load, detect_content};
+
+use crate::loader::LoadType;
+
+#[derive(Debug, Error)]
+pub enum CustomError {
+    #[error("sql expression {0} is not supported")]
+    SqlExpressionError(String),
+    #[error("sql operator {0} is not supported")]
+    SqlOperatorError(String),
+    #[error("sql table {0} is not supported")]
+    SqlTableError(String),
+    #[error("sql select item {0} is not supported")]
+    SqlSelectItemError(String),
+    #[error("sql order by {0} is not supported")]
+    SqlOrderError(String),
+    #[error("sql value {0} is not supported")]
+    SqlValueError(String),
+    #[error("sql statement {0} is not supported")]
+    SqlStatementError(String),
+}
 
 #[derive(Debug)]
 pub struct DataSet(DataFrame);
@@ -34,10 +55,19 @@ impl DerefMut for DataSet {
 }
 
 impl DataSet {
-    /// 从 DataSet 转换成 csv
+    /// Convert DataSet To Csv
     pub fn to_csv(&mut self) -> Result<String> {
         let mut buf = Vec::new();
         let mut writer = CsvWriter::new(&mut buf);
+        writer.finish(self)?;
+        Ok(String::from_utf8(buf)?)
+    }
+
+    /// Convert DataSet To Json
+    pub fn to_json(&mut self) -> Result<String> {
+        println!("------------- come in to_json scope");
+        let mut buf = Vec::new();
+        let mut writer = JsonWriter::new(&mut buf);
         writer.finish(self)?;
         Ok(String::from_utf8(buf)?)
     }
@@ -64,8 +94,7 @@ pub async fn query<T: AsRef<str>>(sql: T) -> Result<DataSet> {
 
     println!("retrieving data from source: {}", source);
 
-    // 从 source 读取一个 DataSet
-    let ds = detect_content(retrieve_data(source).await?).load()?;
+    let ds = detect_content(LoadType::Csv, retrieve_data(source).await?).load()?;
 
     let mut filtered = match condition {
         Some(expr) => ds.0.lazy().filter(expr),

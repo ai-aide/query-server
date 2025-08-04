@@ -15,6 +15,7 @@ fn query(mut cx: FunctionContext) -> JsResult<JsString> {
 
     match output.as_str() {
         "csv" => Ok(cx.string(data.to_csv().unwrap_or("csv type error".to_owned()))),
+        "json" => Ok(cx.string(data.to_json().unwrap_or("json type error".to_owned()))),
         v => cx.throw_type_error(format!("Output type {} not supported", v)),
     }
 }

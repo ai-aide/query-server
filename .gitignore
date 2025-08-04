@@ -1,3 +1,4 @@
 /target
 /query-js/node_modules
 /query-js/index.node
+/query-rs/examples
