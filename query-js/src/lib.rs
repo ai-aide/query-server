@@ -1,4 +1,5 @@
 use neon::prelude::*;
+use query_rs::loader::FormatType;
 
 pub fn example_sql(mut cx: FunctionContext) -> JsResult<JsString> {
     Ok(cx.string(query_rs::example_sql()))
@@ -6,14 +7,26 @@ pub fn example_sql(mut cx: FunctionContext) -> JsResult<JsString> {
 
 fn query(mut cx: FunctionContext) -> JsResult<JsString> {
     let sql = cx.argument::<JsString>(0)?.value(&mut cx);
-    let output = match cx.argument_opt(1) {
+    let arg_prams = match cx.argument_opt(1) {
         Some(v) => v.to_string(&mut cx)?.value(&mut cx),
         None => "csv".to_string(),
     };
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let mut data = rt.block_on(async { query_rs::query(sql).await.unwrap() });
+    let load_type: FormatType = match arg_prams.as_str().try_into() {
+        Ok(inner) => inner,
+        Err(e) => {
+            println!("custom error for {:?} is {:?}", arg_prams, e);
+            FormatType::Csv
+        }
+    };
 
-    match output.as_str() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut data = rt.block_on(async { query_rs::query(sql, load_type).await.unwrap() });
+
+    let output_format = match cx.argument_opt(2) {
+        Some(v) => v.to_string(&mut cx)?.value(&mut cx),
+        None => "csv".to_string(),
+    };
+    match output_format.as_str() {
         "csv" => Ok(cx.string(data.to_csv().unwrap_or("csv type error".to_owned()))),
         "json" => Ok(cx.string(data.to_json().unwrap_or("json type error".to_owned()))),
         v => cx.throw_type_error(format!("Output type {} not supported", v)),

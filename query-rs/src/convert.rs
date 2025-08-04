@@ -295,7 +295,7 @@ impl<'a> From<InterimLimit<'a>> for usize {
                 if let SqlValue::Number(v, _b) = value {
                     v.parse().unwrap_or(usize::MAX)
                 } else {
-                    usize::MAX
+                    100
                 }
             }
             _ => usize::MAX,

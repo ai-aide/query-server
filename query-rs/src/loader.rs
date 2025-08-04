@@ -1,3 +1,4 @@
+use crate::CustomError;
 use crate::DataSet;
 use anyhow::Result;
 use polars::prelude::*;
@@ -9,9 +10,21 @@ pub trait Load {
 }
 
 #[derive(Debug)]
-pub enum LoadType {
+pub enum FormatType {
     Csv,
     Json,
+}
+
+impl TryFrom<&str> for FormatType {
+    type Error = CustomError;
+
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        match value.to_lowercase().as_str() {
+            "csv" => Ok(FormatType::Csv),
+            "json" => Ok(FormatType::Json),
+            v => Err(CustomError::LoadTypeError(v.to_string())),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -35,11 +48,11 @@ impl Loader {
     }
 }
 
-pub fn detect_content(load_type: LoadType, data: String) -> Loader {
+pub fn detect_content(load_type: FormatType, data: String) -> Loader {
     // ToDo Content Detection
     match load_type {
-        LoadType::Csv => Loader::Csv(CsvLoader(data)),
-        LoadType::Json => Loader::Json(JsonLoader(data)),
+        FormatType::Csv => Loader::Csv(CsvLoader(data)),
+        FormatType::Json => Loader::Json(JsonLoader(data)),
     }
 }
 
