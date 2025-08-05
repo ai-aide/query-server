@@ -4,7 +4,7 @@ pub mod fetcher;
 pub mod loader;
 
 use crate::loader::FormatType;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use convert::{OrderType, Sql};
 pub use dialect::TyrDialect;
 pub use dialect::example_sql;
@@ -15,7 +15,9 @@ use sqlparser::parser::Parser;
 use std::convert::TryInto;
 use std::ops::{Deref, DerefMut};
 use thiserror::Error;
+
 type FetchResult<T> = Result<T, CustomError>;
+type QueryResult<T> = Result<T, CustomError>;
 
 #[derive(Debug, Error)]
 pub enum CustomError {
@@ -33,12 +35,16 @@ pub enum CustomError {
     SqlValueError(String),
     #[error("sql statement {0} is not supported")]
     SqlStatementError(String),
+    #[error("sql convert {0} is not supported")]
+    SqlConvertError(String),
     #[error("load type {0} is not supported")]
     LoadTypeError(String),
     #[error("fetch resource {url} error is {error}")]
     FetchError { url: String, error: String },
     #[error("fetch resource type {0} is not support")]
     FetchResourceError(String),
+    #[error("polars error is {error}")]
+    PolarsError { error: String },
 }
 
 #[derive(Debug)]
@@ -69,7 +75,6 @@ impl DataSet {
 
     /// Convert DataSet To Json
     pub fn to_json(&mut self) -> Result<String> {
-        println!("------------- come in to_json scope");
         let mut buf = Vec::new();
         let mut writer = JsonWriter::new(&mut buf);
         writer.finish(self)?;
@@ -77,12 +82,12 @@ impl DataSet {
     }
 }
 
-/// 从 from 中获取数据，从 where 中过滤，最后选取需要返回的列
-pub async fn query<T: AsRef<str>>(sql: T, load_type: FormatType) -> Result<DataSet> {
-    let ast = Parser::parse_sql(&TyrDialect::default(), sql.as_ref())?;
+pub async fn query<T: AsRef<str>>(sql: T, load_type: FormatType) -> QueryResult<DataSet> {
+    let ast = Parser::parse_sql(&TyrDialect::default(), sql.as_ref())
+        .map_err(|e| CustomError::SqlConvertError(e.to_string()))?;
 
     if ast.len() != 1 {
-        return Err(anyhow!("We only support one statement at a time"));
+        return Err(CustomError::SqlConvertError(format!("{:?}", ast)));
     }
 
     let sql = &ast[0];
@@ -96,7 +101,12 @@ pub async fn query<T: AsRef<str>>(sql: T, load_type: FormatType) -> Result<DataS
         order_by,
     } = sql.try_into()?;
 
-    let ds = detect_content(load_type, retrieve_data(source).await?).load()?;
+    let ds = detect_content(load_type, retrieve_data(source).await?)
+        .load()
+        .map_err(|e| CustomError::FetchError {
+            url: "".to_string(),
+            error: e.to_string(),
+        })?;
     let mut filtered = match condition {
         Some(expr) => ds.0.lazy().filter(expr),
         None => ds.0.lazy(),
@@ -121,6 +131,9 @@ pub async fn query<T: AsRef<str>>(sql: T, load_type: FormatType) -> Result<DataS
         filtered
             .select(selection)
             .with_new_streaming(true)
-            .collect()?,
+            .collect()
+            .map_err(|e| CustomError::PolarsError {
+                error: e.to_string(),
+            })?,
     ))
 }
