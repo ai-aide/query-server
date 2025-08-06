@@ -64,6 +64,23 @@ impl DerefMut for DataSet {
     }
 }
 
+#[derive(PartialEq, Eq, Debug)]
+pub struct ColumnType(DataType);
+
+impl Deref for ColumnType {
+    type Target = DataType;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ColumnType {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 impl DataSet {
     /// Convert DataSet To Csv
     pub fn to_csv(&mut self) -> Result<String> {
@@ -82,7 +99,10 @@ impl DataSet {
     }
 }
 
-pub async fn query<T: AsRef<str>>(sql: T, load_type: FormatType) -> QueryResult<DataSet> {
+pub async fn show_columns<T: AsRef<str>>(
+    sql: T,
+    format_type: FormatType,
+) -> QueryResult<Vec<(String, ColumnType)>> {
     let ast = Parser::parse_sql(&TyrDialect::default(), sql.as_ref())
         .map_err(|e| CustomError::SqlConvertError(e.to_string()))?;
 
@@ -90,7 +110,31 @@ pub async fn query<T: AsRef<str>>(sql: T, load_type: FormatType) -> QueryResult<
         return Err(CustomError::SqlConvertError(format!("{:?}", ast)));
     }
 
-    let sql = &ast[0];
+    let Sql { source, .. } = (&ast[0]).try_into()?;
+
+    let ds = detect_content(format_type, retrieve_data(source).await?)
+        .load()
+        .map_err(|e| CustomError::FetchError {
+            url: "".to_string(),
+            error: e.to_string(),
+        })?;
+
+    let list = ds
+        .fields()
+        .into_iter()
+        .map(|inner| (inner.name.to_string(), ColumnType(inner.dtype)))
+        .collect::<Vec<(String, ColumnType)>>();
+
+    Ok(list)
+}
+
+pub async fn query<T: AsRef<str>>(sql: T, format_type: FormatType) -> QueryResult<DataSet> {
+    let ast = Parser::parse_sql(&TyrDialect::default(), sql.as_ref())
+        .map_err(|e| CustomError::SqlConvertError(e.to_string()))?;
+
+    if ast.len() != 1 {
+        return Err(CustomError::SqlConvertError(format!("{:?}", ast)));
+    }
 
     let Sql {
         source,
@@ -99,9 +143,9 @@ pub async fn query<T: AsRef<str>>(sql: T, load_type: FormatType) -> QueryResult<
         offset,
         limit,
         order_by,
-    } = sql.try_into()?;
+    } = (&ast[0]).try_into()?;
 
-    let ds = detect_content(load_type, retrieve_data(source).await?)
+    let ds = detect_content(format_type, retrieve_data(source).await?)
         .load()
         .map_err(|e| CustomError::FetchError {
             url: "".to_string(),
@@ -136,4 +180,65 @@ pub async fn query<T: AsRef<str>>(sql: T, load_type: FormatType) -> QueryResult<
                 error: e.to_string(),
             })?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::loader::FormatType;
+    use tokio;
+
+    #[tokio::test]
+    async fn csv_show_columns_work() {
+        let show_columns_sql = "SHOW COLUMNS FROM https://raw.githubusercontent.com/ai-aide/query-server/refs/heads/master/resource/owid-covid-latest.csv";
+        let columns = show_columns(show_columns_sql, FormatType::Csv).await;
+        assert_eq!(columns.is_ok(), true);
+        if let Ok(column_list) = columns {
+            assert_eq!(column_list.len(), 67);
+            assert_eq!(column_list[0].0, "iso_code");
+            assert_eq!(column_list[1].1, ColumnType(DataType::String));
+        }
+    }
+
+    #[tokio::test]
+    async fn csv_query_work() {
+        let url = "https://raw.githubusercontent.com/ai-aide/query-server/refs/heads/master/resource/owid-covid-latest.csv";
+        let sql = format!(
+            "SELECT total_deaths, new_deaths  FROM {} where new_deaths >= 5 and total_deaths>29.0  ORDER BY total_deaths, new_deaths DESC LIMIT 10 OFFSET 0",
+            url
+        );
+        let res = query(sql, FormatType::Csv).await;
+        assert_eq!(res.is_ok(), true);
+        if let Ok(dataset) = res {
+            assert_eq!(dataset.height(), 10);
+            assert_eq!(dataset.width(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn json_show_columns_work() {
+        let show_columns_sql = "SHOW COLUMNS FROM https://raw.githubusercontent.com/ai-aide/query-server/refs/heads/master/resource/iris.json";
+        let columns = show_columns(show_columns_sql, FormatType::Json).await;
+        assert_eq!(columns.is_ok(), true);
+        if let Ok(column_list) = columns {
+            assert_eq!(column_list.len(), 5);
+            assert_eq!(column_list[0].0, "sepalLength");
+            assert_eq!(column_list[1].1, ColumnType(DataType::Float64));
+        }
+    }
+
+    #[tokio::test]
+    async fn json_query_work() {
+        let url = "https://raw.githubusercontent.com/ai-aide/query-server/refs/heads/master/resource/iris.json";
+        let sql = format!(
+            "SELECT sepalLength, sepalWidth FROM {} WHERE sepalLength > 5.0 LIMIT 10 offset 1",
+            url
+        );
+        let res = query(sql, FormatType::Json).await;
+        assert_eq!(res.is_ok(), true);
+        if let Ok(dataset) = res {
+            assert_eq!(dataset.height(), 10);
+            assert_eq!(dataset.width(), 2);
+        }
+    }
 }

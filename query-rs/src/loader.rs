@@ -48,9 +48,9 @@ impl Loader {
     }
 }
 
-pub fn detect_content(load_type: FormatType, data: String) -> Loader {
+pub fn detect_content(format_type: FormatType, data: String) -> Loader {
     // ToDo Content Detection
-    match load_type {
+    match format_type {
         FormatType::Csv => Loader::Csv(CsvLoader(data)),
         FormatType::Json => Loader::Json(JsonLoader(data)),
     }

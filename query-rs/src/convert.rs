@@ -80,7 +80,7 @@ impl<'a> TryFrom<&'a Statement> for Sql<'a> {
                     None => None,
                 };
 
-                let mut selection = Vec::with_capacity(8);
+                let mut selection = Vec::new();
                 for p in projection {
                     let expr = InterimSelectItem(p).try_into()?;
                     selection.push(expr);
@@ -93,6 +93,30 @@ impl<'a> TryFrom<&'a Statement> for Sql<'a> {
                     offset,
                     condition,
                     order_by,
+                })
+            }
+            Statement::ShowColumns {
+                extended,
+                full,
+                show_options,
+            } => {
+                let source = if let Some(inner) = &show_options.show_in
+                    && let Some(object) = &inner.parent_name
+                    && object.0.len() == 1
+                    && let ObjectNamePart::Identifier(ident) = &object.0[0]
+                {
+                    ident.value.as_str()
+                } else {
+                    return Err(CustomError::SqlStatementError(show_options.to_string()));
+                };
+
+                Ok(Sql {
+                    selection: vec![],
+                    source,
+                    limit: None,
+                    offset: None,
+                    condition: None,
+                    order_by: vec![],
                 })
             }
             v => Err(CustomError::SqlStatementError(format!("{:?}", v))),
@@ -174,6 +198,7 @@ impl TryFrom<&str> for InterimOperator {
             "=" => Ok(InterimOperator(SqlBinaryOperator::Eq)),
             "<" => Ok(InterimOperator(SqlBinaryOperator::Lt)),
             "<=" => Ok(InterimOperator(SqlBinaryOperator::LtEq)),
+            "!=" => Ok(InterimOperator(SqlBinaryOperator::NotEq)),
             _ => Err(CustomError::SqlOperatorError(value.to_owned())),
         }
     }
@@ -325,7 +350,7 @@ mod tests {
     use sqlparser::parser::Parser;
 
     #[test]
-    fn parse_sql_works() {
+    fn parse_query_sql_work() {
         let url = "http://abc.xyz/abc?a=1&b=2";
         let sql = format!(
             "SELECT
@@ -388,5 +413,14 @@ mod tests {
         );
         // verify select item
         assert_eq!(sql.selection, vec![col("a"), col("b"), col("c")]);
+    }
+
+    #[test]
+    fn parse_show_columns_sql_work() {
+        let url = "https://raw.githubusercontent.com/ai-aide/query-server/refs/heads/master/resource/owid-covid-latest.csv";
+        let sql = format!("SHOW COLUMNS FROM {}", url);
+        let statement = &Parser::parse_sql(&TyrDialect::default(), sql.as_ref()).unwrap()[0];
+        let sql: Sql = statement.try_into().unwrap();
+        assert_eq!(sql.source, url);
     }
 }

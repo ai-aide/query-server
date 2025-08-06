@@ -19,5 +19,4 @@ tokio = { version = "1.46.1", features = ["full"]}
 tracing-subscriber = "0.3.19"
 
 [[example]]
-name = "dialect"
-# path = "examples/dialect.rs"
+name = "sql-ast-1"
