@@ -2,10 +2,13 @@ use crate::CustomError;
 use anyhow::{Result, anyhow};
 use polars::prelude::*;
 use polars_plan::plans::{DynLiteralValue, LiteralValue};
-use sqlparser::ast::{
-    BinaryOperator as SqlBinaryOperator, Expr as SqlExpr, Ident, LimitClause, ObjectNamePart,
-    Offset as SqlOffset, OrderBy, OrderByKind, Select, SelectItem, SetExpr, Statement, TableFactor,
-    TableWithJoins, Value as SqlValue, ValueWithSpan,
+use sqlparser::{
+    ast::{
+        BinaryOperator as SqlBinaryOperator, Expr as SqlExpr, Ident, LimitClause, ObjectNamePart,
+        Offset as SqlOffset, OrderBy, OrderByKind, Select, SelectItem, SetExpr, Statement,
+        TableFactor, TableWithJoins, Value as SqlValue, ValueWithSpan,
+    },
+    tokenizer::Token,
 };
 
 /// Custom Sql struct
@@ -218,6 +221,14 @@ impl<'a> TryFrom<InterimSelectItem<'a>> for Expr {
                 Arc::new(Expr::Column((&id.value).into())),
                 (&alias.value).to_owned().into(),
             )),
+            SelectItem::Wildcard(wildcard_options) => {
+                let token_with_span = wildcard_options.wildcard_token.0.clone();
+                let token = token_with_span.token;
+                match token {
+                    Token::Mul => Ok(Expr::Wildcard),
+                    _ => return Err(CustomError::SqlSelectItemError(token.to_string())),
+                }
+            }
             item => Err(CustomError::SqlSelectItemError(item.to_string())),
         }
     }
@@ -354,12 +365,12 @@ mod tests {
         let url = "http://abc.xyz/abc?a=1&b=2";
         let sql = format!(
             "SELECT
-                a, 
-                b, 
-                c 
-            FROM {} 
-            WHERE a = 100 and b = 200 and c=300 
-            ORDER BY c, e DESC, b ASC 
+                a,
+                b,
+                c
+            FROM {}
+            WHERE a = 100 and b = 200 and c=300
+            ORDER BY c, e DESC, b ASC
             LIMIT 5 OFFSET 10",
             url
         );

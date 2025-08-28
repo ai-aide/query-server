@@ -17,11 +17,16 @@ impl Dialect for TyrDialect {
 }
 
 pub fn example_sql() -> String {
-    let url = "https://raw.githubusercontent.com/owid/covid-19-data/master/public/data/latest/owid-covid-latest.csv";
+    let url = "https://raw.githubusercontent.com/ai-aide/query-server/refs/heads/master/resource/owid-covid-latest.csv";
     let sql = format!(
         "SELECT total_deaths, new_deaths  FROM {} where new_deaths >= 5 and total_deaths>29.0  ORDER BY total_deaths, new_deaths DESC LIMIT 10 OFFSET 0",
         url
     );
+    // let url = "https://raw.githubusercontent.com/ai-aide/query-server/refs/heads/master/resource/iris.json";
+    // let sql = format!(
+    //     "SELECT sepalLength, sepalWidth  FROM {} where sepalWidth >= 2.5 and sepalWidth>1.0  ORDER BY sepalWidth DESC LIMIT 10 OFFSET 0",
+    //     url
+    // );
     sql
 }
 

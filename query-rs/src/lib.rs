@@ -241,4 +241,19 @@ mod tests {
             assert_eq!(dataset.width(), 2);
         }
     }
+
+    #[tokio::test]
+    async fn json_query_wildcard_work() {
+        let url = "https://raw.githubusercontent.com/ai-aide/query-server/refs/heads/master/resource/iris.json";
+        let sql = format!(
+            "SELECT * FROM {} WHERE sepalLength > 5.0 LIMIT 10 offset 1",
+            url
+        );
+        let res = query(sql, FormatType::Json).await;
+        assert_eq!(res.is_ok(), true);
+        if let Ok(dataset) = res {
+            assert_eq!(dataset.height(), 10);
+            assert_eq!(dataset.width(), 5);
+        }
+    }
 }

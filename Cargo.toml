@@ -1,6 +1,8 @@
 [workspace]
 
 members = [ 
-    "query-js",
-    "query-rs"
+    "query-js", 
+    "query-py",
+    "query-rs",
+    "query"
 ]
