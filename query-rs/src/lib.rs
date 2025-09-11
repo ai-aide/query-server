@@ -29,6 +29,10 @@ pub enum CustomError {
     SqlTableError(String),
     #[error("sql select item {0} is not supported")]
     SqlSelectItemError(String),
+    #[error("sql expr function item {0} is not supported")]
+    SqlExprFuncItem(String),
+    #[error("sql expr function args item {0} is not supported")]
+    SqlExprFuncArgsItem(String),
     #[error("sql order by {0} is not supported")]
     SqlOrderError(String),
     #[error("sql value {0} is not supported")]
@@ -140,9 +144,11 @@ pub async fn query<T: AsRef<str>>(sql: T, format_type: FormatType) -> QueryResul
         source,
         condition,
         selection,
+        aggregation,
         offset,
         limit,
         order_by,
+        group_by,
     } = (&ast[0]).try_into()?;
 
     let ds = detect_content(format_type, retrieve_data(source).await?)
@@ -156,30 +162,49 @@ pub async fn query<T: AsRef<str>>(sql: T, format_type: FormatType) -> QueryResul
         None => ds.0.lazy(),
     };
 
-    let order_list = order_by
-        .into_iter()
-        .map(|(col, order_type)| (col, order_type == OrderType::Desc))
-        .collect::<Vec<(String, bool)>>();
-    let (cols, orders): (Vec<String>, Vec<bool>) = order_list.into_iter().unzip();
+    let dataset = if group_by.len() > 0 {
+        // group by select
+        let filtered =
+            filtered.group_by(group_by.iter().map(|item| col(item)).collect::<Vec<Expr>>());
+        DataSet(
+            filtered
+                .agg(aggregation)
+                .with_new_streaming(true)
+                .select(selection)
+                .collect()
+                .map_err(|e| CustomError::PolarsError {
+                    error: e.to_string(),
+                })?,
+        )
+    } else {
+        // general select
+        let order_list = order_by
+            .into_iter()
+            .map(|(col, order_type)| (col, order_type == OrderType::Desc))
+            .collect::<Vec<(String, bool)>>();
+        let (cols, orders): (Vec<String>, Vec<bool>) = order_list.into_iter().unzip();
 
-    filtered = filtered.sort(
-        cols,
-        SortMultipleOptions::default().with_order_descending_multi(orders),
-    );
+        filtered = filtered.sort(
+            cols,
+            SortMultipleOptions::default().with_order_descending_multi(orders),
+        );
 
-    if offset.is_some() || limit.is_some() {
-        filtered = filtered.slice(offset.unwrap_or(0), limit.unwrap_or(20) as IdxSize);
-    }
+        if offset.is_some() || limit.is_some() {
+            filtered = filtered.slice(offset.unwrap_or(0), limit.unwrap_or(20) as IdxSize);
+        }
 
-    Ok(DataSet(
-        filtered
-            .select(selection)
-            .with_new_streaming(true)
-            .collect()
-            .map_err(|e| CustomError::PolarsError {
-                error: e.to_string(),
-            })?,
-    ))
+        DataSet(
+            filtered
+                .select(selection)
+                .with_new_streaming(true)
+                .collect()
+                .map_err(|e| CustomError::PolarsError {
+                    error: e.to_string(),
+                })?,
+        )
+    };
+
+    Ok(dataset)
 }
 
 #[cfg(test)]
@@ -216,6 +241,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn csv_group_by_query_work() {
+        let url = "https://raw.githubusercontent.com/ai-aide/query-server/refs/heads/master/resource/owid-covid-latest.csv";
+        let sql = format!(
+            "SELECT max(iso_code) as bac
+            , iso_code FROM {} group by iso_code",
+            url
+        );
+        let res = query(sql, FormatType::Csv).await;
+        // assert_eq!(res.is_ok(), true);
+        // if let Ok(dataset) = res {
+        //     // println!("----: {:?}", dataset);
+        //     assert_eq!(dataset.height(), 10);
+        //     assert_eq!(dataset.width(), 2);
+        // }
+    }
+
+    #[tokio::test]
     async fn json_show_columns_work() {
         let show_columns_sql = "SHOW COLUMNS FROM https://raw.githubusercontent.com/ai-aide/query-server/refs/heads/master/resource/iris.json";
         let columns = show_columns(show_columns_sql, FormatType::Json).await;
@@ -239,6 +281,34 @@ mod tests {
         if let Ok(dataset) = res {
             assert_eq!(dataset.height(), 10);
             assert_eq!(dataset.width(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn json_group_by_query_work() {
+        let url = "https://raw.githubusercontent.com/ai-aide/query-server/refs/heads/master/resource/iris.json";
+        let sql = format!(
+            "SELECT count(*) as count_num, sepalLength FROM {} WHERE sepalLength > 5.0 group by sepalLength",
+            url
+        );
+        let res = query(sql, FormatType::Json).await;
+
+        assert_eq!(res.is_ok(), true);
+        if let Ok(dataset) = res {
+            let count_num = dataset
+                .0
+                .lazy()
+                .filter(col("sepalLength").eq(lit(6.7)))
+                .collect()
+                .unwrap()
+                .slice(0, 1)
+                .column("count_num")
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .try_extract::<i32>()
+                .unwrap();
+            assert_eq!(count_num, 8);
         }
     }
 

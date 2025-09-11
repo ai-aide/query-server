@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.98"
 async-trait = "0.1.88"
+polar-core = "0.27.3"
 polars = { version = "0.49.1", features = ["json", "lazy", "polars-io"] } # DataFrame 库
 polars-plan = "0.49.1"
 reqwest = { version = "0.12.22", default-features = false, features = ["rustls-tls"]}

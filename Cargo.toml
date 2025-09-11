@@ -1,8 +1,7 @@
 [workspace]
 
-members = [ 
-    "query-js", 
+members = [
+    "query-js",
     "query-py",
     "query-rs",
-    "query"
 ]

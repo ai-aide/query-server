@@ -4,21 +4,43 @@ use polars::prelude::*;
 use polars_plan::plans::{DynLiteralValue, LiteralValue};
 use sqlparser::{
     ast::{
-        BinaryOperator as SqlBinaryOperator, Expr as SqlExpr, Ident, LimitClause, ObjectNamePart,
-        Offset as SqlOffset, OrderBy, OrderByKind, Select, SelectItem, SetExpr, Statement,
-        TableFactor, TableWithJoins, Value as SqlValue, ValueWithSpan,
+        BinaryOperator as SqlBinaryOperator, Expr as SqlExpr, Function, FunctionArg,
+        FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, LimitClause,
+        ObjectNamePart, Offset as SqlOffset, OrderBy, OrderByKind, Select, SelectItem, SetExpr,
+        Statement, TableFactor, TableWithJoins, Value as SqlValue, ValueWithSpan,
     },
     tokenizer::Token,
 };
 
 /// Custom Sql struct
+#[derive(Debug, Default)]
 pub struct Sql<'a> {
+    pub(crate) aggregation: Vec<Expr>,
     pub(crate) selection: Vec<Expr>,
     pub(crate) condition: Option<Expr>,
     pub(crate) source: &'a str,
     pub(crate) order_by: Vec<(String, OrderType)>,
+    pub(crate) group_by: Vec<String>,
     pub(crate) offset: Option<i64>,
     pub(crate) limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum AggFunc {
+    Max,
+    Min,
+    Count,
+}
+
+impl AggFunc {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "max" => Some(Self::Max),
+            "min" => Some(Self::Min),
+            "count" => Some(Self::Count),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,10 +53,13 @@ pub struct InterimExpr(pub(crate) Box<SqlExpr>);
 pub struct InterimOperator(pub(crate) SqlBinaryOperator);
 // Selection item, example: age > 10
 pub struct InterimSelectItem<'a>(pub(crate) &'a SelectItem);
+pub struct InterimFuncExprItem<'a>(pub(crate) &'a Function);
+pub struct InterimFuncArgsExprItem<'a>(pub(crate) &'a FunctionArguments);
 // Source table
 pub struct InterimSource<'a>(pub(crate) &'a [TableWithJoins]);
 // Order formula, example: order by member_id
 pub struct InterimOrderBy<'a>(pub(crate) &'a OrderBy);
+pub struct InterimGroupBy<'a>(pub(crate) &'a GroupByExpr);
 
 pub struct InterimOffset<'a>(pub(crate) &'a SqlOffset);
 pub struct InterimLimit<'a>(pub(crate) &'a SqlExpr);
@@ -70,7 +95,7 @@ impl<'a> TryFrom<&'a Statement> for Sql<'a> {
                     selection: where_clause,
                     projection,
 
-                    group_by: _,
+                    group_by: inner_group_by,
                     ..
                 } = match q.body.as_ref() {
                     SetExpr::Select(statement) => statement.as_ref(),
@@ -83,19 +108,42 @@ impl<'a> TryFrom<&'a Statement> for Sql<'a> {
                     None => None,
                 };
 
+                // group by
+                let group_by: Vec<String> = InterimGroupBy(inner_group_by).try_into()?;
+
                 let mut selection = Vec::new();
-                for p in projection {
-                    let expr = InterimSelectItem(p).try_into()?;
-                    selection.push(expr);
+                let mut aggregation = Vec::new();
+                if group_by.len() > 0 {
+                    for p in projection {
+                        let expr: Expr = InterimSelectItem(p).try_into()?;
+                        match &expr {
+                            Expr::Alias(inner_expr, column_name) => {
+                                selection.push(col(column_name.as_str()));
+                                if matches!(inner_expr.as_ref(), Expr::Agg(_))
+                                    || matches!(inner_expr.as_ref(), Expr::Len)
+                                {
+                                    aggregation.push(expr);
+                                }
+                            }
+                            _ => selection.push(expr),
+                        }
+                    }
+                } else {
+                    for p in projection {
+                        let expr = InterimSelectItem(p).try_into()?;
+                        selection.push(expr);
+                    }
                 }
 
                 Ok(Sql {
                     selection,
+                    aggregation,
                     source,
                     limit,
                     offset,
                     condition,
                     order_by,
+                    group_by,
                 })
             }
             Statement::ShowColumns {
@@ -115,11 +163,13 @@ impl<'a> TryFrom<&'a Statement> for Sql<'a> {
 
                 Ok(Sql {
                     selection: vec![],
+                    aggregation: vec![],
                     source,
                     limit: None,
                     offset: None,
                     condition: None,
                     order_by: vec![],
+                    group_by: vec![],
                 })
             }
             v => Err(CustomError::SqlStatementError(format!("{:?}", v))),
@@ -149,6 +199,7 @@ impl TryFrom<InterimExpr> for Expr {
                                     .try_into()?,
                             ),
                             op: temp_op.try_into()?,
+                            // ToDo
                             right: Arc::new(
                                 InterimExpr(Box::new(SqlExpr::Value(
                                     SqlValue::Number(right.to_owned(), true).into(),
@@ -214,13 +265,29 @@ impl<'a> TryFrom<InterimSelectItem<'a>> for Expr {
     fn try_from(p: InterimSelectItem<'a>) -> std::result::Result<Self, Self::Error> {
         match p.0 {
             SelectItem::UnnamedExpr(SqlExpr::Identifier(id)) => Ok(col(&id.to_string())),
+            SelectItem::UnnamedExpr(SqlExpr::Function(inner_func)) => {
+                let expr = InterimFuncExprItem(inner_func).try_into()?;
+                let column_name: String = InterimFuncArgsExprItem(&inner_func.args).try_into()?;
+                let target_column_name = format!("{}-agg", column_name.as_str().to_string());
+                Ok(Expr::Alias(Arc::new(expr), target_column_name.into()))
+            }
             SelectItem::ExprWithAlias {
                 expr: SqlExpr::Identifier(id),
                 alias,
             } => Ok(Expr::Alias(
                 Arc::new(Expr::Column((&id.value).into())),
-                (&alias.value).to_owned().into(),
+                alias.value.to_owned().into(),
             )),
+            SelectItem::ExprWithAlias {
+                expr: SqlExpr::Function(inner_func),
+                alias,
+            } => {
+                let temp_expr: Expr = InterimFuncExprItem(inner_func).try_into()?;
+                Ok(Expr::Alias(
+                    Arc::new(temp_expr),
+                    alias.value.to_owned().into(),
+                ))
+            }
             SelectItem::Wildcard(wildcard_options) => {
                 let token_with_span = wildcard_options.wildcard_token.0.clone();
                 let token = token_with_span.token;
@@ -231,6 +298,76 @@ impl<'a> TryFrom<InterimSelectItem<'a>> for Expr {
             }
             item => Err(CustomError::SqlSelectItemError(item.to_string())),
         }
+    }
+}
+
+impl<'a> TryFrom<InterimFuncExprItem<'a>> for Expr {
+    type Error = CustomError;
+
+    fn try_from(v: InterimFuncExprItem<'a>) -> std::result::Result<Self, Self::Error> {
+        let Function { name, args, .. } = v.0;
+
+        // get aggregation func name
+        let agg_func = if let ObjectNamePart::Identifier(ident) = &name.0[0] {
+            AggFunc::from_str(&ident.value).ok_or_else(|| {
+                CustomError::SqlExprFuncItem(format!(
+                    "Unsupported aggregation function: {}",
+                    ident.value
+                ))
+            })?
+        } else {
+            return Err(CustomError::SqlExprFuncItem(format!(
+                "Invalid aggregation function name ({:?})",
+                &name.0
+            )));
+        };
+
+        // get column name
+        let column_name: String = InterimFuncArgsExprItem(args).try_into()?;
+
+        // generate aggregation
+        match agg_func {
+            AggFunc::Max => Ok(col(&column_name).max()),
+            AggFunc::Min => Ok(col(&column_name).min()),
+            AggFunc::Count => {
+                if column_name == "*" {
+                    Ok(len())
+                } else {
+                    Ok(col(&column_name).count())
+                }
+            }
+        }
+    }
+}
+
+impl<'a> TryFrom<InterimFuncArgsExprItem<'a>> for String {
+    type Error = CustomError;
+
+    fn try_from(args: InterimFuncArgsExprItem) -> std::result::Result<Self, Self::Error> {
+        let column_name = match args.0 {
+            FunctionArguments::List(FunctionArgumentList {
+                args: inner_args, ..
+            }) if !inner_args.is_empty() => match &inner_args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Identifier(ident))) => {
+                    ident.value.clone()
+                }
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => "*".to_string(),
+                _ => {
+                    return Err(CustomError::SqlExprFuncArgsItem(format!(
+                        "Aggregation function requires argument ({:?})",
+                        &inner_args[0]
+                    )));
+                }
+            },
+            _ => {
+                return Err(CustomError::SqlExprFuncArgsItem(format!(
+                    "Aggregation function requires arguments ({:?})",
+                    &args.0
+                )));
+            }
+        };
+
+        Ok(column_name)
     }
 }
 
@@ -320,6 +457,29 @@ impl<'a> From<InterimOffset<'a>> for i64 {
             } => v.parse().unwrap_or(0),
             _ => 0,
         }
+    }
+}
+
+/// Convert to SqlParser group by to string vec
+impl<'a> TryFrom<InterimGroupBy<'a>> for Vec<String> {
+    type Error = CustomError;
+
+    fn try_from(g: InterimGroupBy<'a>) -> std::result::Result<Self, Self::Error> {
+        let list = match &g.0 {
+            GroupByExpr::Expressions(expr_list, _) => {
+                expr_list
+                    .iter()
+                    .fold(Vec::new(), |mut acc: Vec<String>, group_by| {
+                        if let SqlExpr::Identifier(id) = group_by {
+                            acc.push(id.value.to_owned());
+                        }
+                        acc
+                    })
+            }
+            _ => vec![],
+        };
+
+        Ok(list)
     }
 }
 
@@ -424,6 +584,25 @@ mod tests {
         );
         // verify select item
         assert_eq!(sql.selection, vec![col("a"), col("b"), col("c")]);
+    }
+
+    #[test]
+    fn parse_group_by_query_sql_work() {
+        let url = "http://abc.xyz/abc?a=1&b=2";
+        let sql = format!(
+            "SELECT
+                a,
+                b,
+                count(*) as test_count
+            FROM {}
+            group by a, b",
+            url
+        );
+        let statement = &Parser::parse_sql(&TyrDialect::default(), sql.as_ref()).unwrap()[0];
+        let sql: Sql = statement.try_into().unwrap();
+        assert_eq!(sql.group_by, vec!["a", "b"]);
+        assert_eq!(sql.selection, vec![col("a"), col("b"), col("test_count")]);
+        assert_eq!(sql.aggregation, vec![len().alias("test_count")])
     }
 
     #[test]
