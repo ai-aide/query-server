@@ -164,8 +164,12 @@ pub async fn query<T: AsRef<str>>(sql: T, format_type: FormatType) -> QueryResul
 
     let dataset = if group_by.len() > 0 {
         // group by select
-        let filtered =
-            filtered.group_by(group_by.iter().map(|item| col(item)).collect::<Vec<Expr>>());
+        let filtered = filtered.group_by(
+            group_by
+                .iter()
+                .map(|item| col(*item))
+                .collect::<Vec<Expr>>(),
+        );
         DataSet(
             filtered
                 .agg(aggregation)
@@ -181,8 +185,8 @@ pub async fn query<T: AsRef<str>>(sql: T, format_type: FormatType) -> QueryResul
         let order_list = order_by
             .into_iter()
             .map(|(col, order_type)| (col, order_type == OrderType::Desc))
-            .collect::<Vec<(String, bool)>>();
-        let (cols, orders): (Vec<String>, Vec<bool>) = order_list.into_iter().unzip();
+            .collect::<Vec<(&str, bool)>>();
+        let (cols, orders): (Vec<&str>, Vec<bool>) = order_list.into_iter().unzip();
 
         filtered = filtered.sort(
             cols,
@@ -209,9 +213,12 @@ pub async fn query<T: AsRef<str>>(sql: T, format_type: FormatType) -> QueryResul
 
 #[cfg(test)]
 mod tests {
+    use std::any;
+
     use super::*;
     use crate::loader::FormatType;
     use tokio;
+    use tracing_subscriber::fmt::format;
 
     #[tokio::test]
     async fn csv_show_columns_work() {
@@ -241,20 +248,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn csv_query_condition_work() {
+        let url = "https://raw.githubusercontent.com/ai-aide/query-server/refs/heads/master/resource/iris.json";
+        let sql = format!(
+            "SELECT sum(sepalLength) as total_sum FROM {} WHERE species = 'setosa' group by species",
+            url
+        );
+        let res = query(sql, FormatType::Json).await;
+
+        assert_eq!(res.is_ok(), true);
+        if let Ok(dataset) = res {
+            let df = dataset.0.lazy().collect().unwrap();
+            let value = df.column("total_sum").unwrap().get(0).unwrap();
+
+            let AnyValue::Float64(target) = value else {
+                return assert!(false);
+            };
+            assert!(-0.000000001 < target - 250.3 && target - 250.3 < 0.000000001);
+        }
+    }
+
+    #[tokio::test]
     async fn csv_group_by_query_work() {
         let url = "https://raw.githubusercontent.com/ai-aide/query-server/refs/heads/master/resource/owid-covid-latest.csv";
         let sql = format!(
-            "SELECT max(iso_code) as bac
+            "SELECT max(iso_code) as iso_code_alias
             , iso_code FROM {} group by iso_code",
             url
         );
         let res = query(sql, FormatType::Csv).await;
-        // assert_eq!(res.is_ok(), true);
-        // if let Ok(dataset) = res {
-        //     // println!("----: {:?}", dataset);
-        //     assert_eq!(dataset.height(), 10);
-        //     assert_eq!(dataset.width(), 2);
-        // }
+        assert_eq!(res.is_ok(), true);
+        if let Ok(dataset) = res {
+            let df = dataset
+                .0
+                .lazy()
+                .filter(col("iso_code_alias").eq(lit("EST")))
+                .collect()
+                .unwrap();
+            let value = df.column("iso_code_alias").unwrap().get(0).unwrap();
+            let AnyValue::StringOwned(target) = value else {
+                return assert!(false);
+            };
+            assert_eq!(target, "EST");
+        }
     }
 
     #[tokio::test]

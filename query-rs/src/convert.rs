@@ -1,5 +1,5 @@
 use crate::CustomError;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use polars::prelude::*;
 use polars_plan::plans::{DynLiteralValue, LiteralValue};
 use sqlparser::{
@@ -19,8 +19,8 @@ pub struct Sql<'a> {
     pub(crate) selection: Vec<Expr>,
     pub(crate) condition: Option<Expr>,
     pub(crate) source: &'a str,
-    pub(crate) order_by: Vec<(String, OrderType)>,
-    pub(crate) group_by: Vec<String>,
+    pub(crate) order_by: Vec<(&'a str, OrderType)>,
+    pub(crate) group_by: Vec<&'a str>,
     pub(crate) offset: Option<i64>,
     pub(crate) limit: Option<usize>,
 }
@@ -29,6 +29,8 @@ pub struct Sql<'a> {
 pub enum AggFunc {
     Max,
     Min,
+    Sum,
+    Avg,
     Count,
 }
 
@@ -37,6 +39,8 @@ impl AggFunc {
         match s.to_lowercase().as_str() {
             "max" => Some(Self::Max),
             "min" => Some(Self::Min),
+            "sum" => Some(Self::Sum),
+            "avg" => Some(Self::Avg),
             "count" => Some(Self::Count),
             _ => None,
         }
@@ -53,14 +57,15 @@ pub struct InterimExpr(pub(crate) Box<SqlExpr>);
 pub struct InterimOperator(pub(crate) SqlBinaryOperator);
 // Selection item, example: age > 10
 pub struct InterimSelectItem<'a>(pub(crate) &'a SelectItem);
+// Aggregation condition
 pub struct InterimFuncExprItem<'a>(pub(crate) &'a Function);
 pub struct InterimFuncArgsExprItem<'a>(pub(crate) &'a FunctionArguments);
 // Source table
 pub struct InterimSource<'a>(pub(crate) &'a [TableWithJoins]);
-// Order formula, example: order by member_id
+// Order & group formula, example: order by member_id
 pub struct InterimOrderBy<'a>(pub(crate) &'a OrderBy);
 pub struct InterimGroupBy<'a>(pub(crate) &'a GroupByExpr);
-
+// Sql limit or offset
 pub struct InterimOffset<'a>(pub(crate) &'a SqlOffset);
 pub struct InterimLimit<'a>(pub(crate) &'a SqlExpr);
 pub struct InterimValue(pub(crate) SqlValue);
@@ -109,7 +114,7 @@ impl<'a> TryFrom<&'a Statement> for Sql<'a> {
                 };
 
                 // group by
-                let group_by: Vec<String> = InterimGroupBy(inner_group_by).try_into()?;
+                let group_by: Vec<&'a str> = InterimGroupBy(inner_group_by).try_into()?;
 
                 let mut selection = Vec::new();
                 let mut aggregation = Vec::new();
@@ -268,7 +273,8 @@ impl<'a> TryFrom<InterimSelectItem<'a>> for Expr {
             SelectItem::UnnamedExpr(SqlExpr::Function(inner_func)) => {
                 let expr = InterimFuncExprItem(inner_func).try_into()?;
                 let column_name: String = InterimFuncArgsExprItem(&inner_func.args).try_into()?;
-                let target_column_name = format!("{}-agg", column_name.as_str().to_string());
+                // Aggregation columns require alias name
+                let target_column_name = format!("{}_agg", column_name.as_str().to_string());
                 Ok(Expr::Alias(Arc::new(expr), target_column_name.into()))
             }
             SelectItem::ExprWithAlias {
@@ -329,6 +335,8 @@ impl<'a> TryFrom<InterimFuncExprItem<'a>> for Expr {
         match agg_func {
             AggFunc::Max => Ok(col(&column_name).max()),
             AggFunc::Min => Ok(col(&column_name).min()),
+            AggFunc::Sum => Ok(col(&column_name).sum()),
+            AggFunc::Avg => Ok(col(&column_name).mean()),
             AggFunc::Count => {
                 if column_name == "*" {
                     Ok(len())
@@ -401,7 +409,7 @@ impl<'a> TryFrom<InterimSource<'a>> for &'a str {
 }
 
 /// Convert SqlParser order by expr to Vec<(String, OrderType)>
-impl<'a> TryFrom<InterimOrderBy<'a>> for Vec<(String, OrderType)> {
+impl<'a> TryFrom<InterimOrderBy<'a>> for Vec<(&'a str, OrderType)> {
     type Error = CustomError;
 
     fn try_from(o: InterimOrderBy<'a>) -> Result<Self, Self::Error> {
@@ -409,7 +417,7 @@ impl<'a> TryFrom<InterimOrderBy<'a>> for Vec<(String, OrderType)> {
             OrderByKind::Expressions(order_by_list) => {
                 let order_list = order_by_list.iter().rfold(
                     Vec::new(),
-                    |mut acc: Vec<(String, OrderType)>, order_by| {
+                    |mut acc: Vec<(&'a str, OrderType)>, order_by| {
                         if let SqlExpr::Identifier(id) = &order_by.expr {
                             let order_type = if let Some(is_asc) = order_by.options.asc {
                                 if is_asc == true {
@@ -422,7 +430,7 @@ impl<'a> TryFrom<InterimOrderBy<'a>> for Vec<(String, OrderType)> {
                             } else {
                                 OrderType::Desc
                             };
-                            acc.push((id.value.to_string(), order_type));
+                            acc.push((id.value.as_str(), order_type));
                         } else {
                             // return Err(CustomError::SqlOrderError(order_by.expr);
                             println!(
@@ -461,7 +469,7 @@ impl<'a> From<InterimOffset<'a>> for i64 {
 }
 
 /// Convert to SqlParser group by to string vec
-impl<'a> TryFrom<InterimGroupBy<'a>> for Vec<String> {
+impl<'a> TryFrom<InterimGroupBy<'a>> for Vec<&'a str> {
     type Error = CustomError;
 
     fn try_from(g: InterimGroupBy<'a>) -> std::result::Result<Self, Self::Error> {
@@ -469,9 +477,9 @@ impl<'a> TryFrom<InterimGroupBy<'a>> for Vec<String> {
             GroupByExpr::Expressions(expr_list, _) => {
                 expr_list
                     .iter()
-                    .fold(Vec::new(), |mut acc: Vec<String>, group_by| {
+                    .fold(Vec::new(), |mut acc: Vec<&'a str>, group_by| {
                         if let SqlExpr::Identifier(id) = group_by {
-                            acc.push(id.value.to_owned());
+                            acc.push(id.value.as_str());
                         }
                         acc
                     })
@@ -508,8 +516,10 @@ impl TryFrom<InterimValue> for LiteralValue {
             SqlValue::Number(v, _) => Ok(LiteralValue::Dyn(DynLiteralValue::Float(
                 v.parse().unwrap_or_default(),
             ))),
+            SqlValue::SingleQuotedString(v) => {
+                Ok(LiteralValue::Dyn(DynLiteralValue::Str(v.into())))
+            }
             v => Err(CustomError::SqlValueError(format!("{}", v))),
-            // v => Err(anyhow!("Value {} is not supported", v)),
         }
     }
 }
